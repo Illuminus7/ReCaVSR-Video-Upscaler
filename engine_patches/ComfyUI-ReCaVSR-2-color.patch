@@ -1,0 +1,67 @@
+diff --git a/nodes.py b/nodes.py
+--- a/nodes.py
++++ b/nodes.py
+@@ -163,7 +163,7 @@
+         latents = []
+         progress = comfy.utils.ProgressBar(len(blocks))
+         with comfy.model_management.cuda_device_context(device):
+-            writer = Writer(path, size[1], size[0], source.fps, encoder, device, source.audio)
++            writer = Writer(path, size[1], size[0], source.fps, encoder, device, source.audio, color=source.color)
+             stream = VideoStream(model.transformer.model, model.prompt, height, width, seed, device, kernels,
+                                  torch.device("cpu") if kv_offload else None)
+             decode = DecoderStream(model.decoder.model, model.latent_format, device, torch.bfloat16, kernels) if decoder == "flashdecoder" else None
+diff --git a/recavsr/video_io.py b/recavsr/video_io.py
+--- a/recavsr/video_io.py
++++ b/recavsr/video_io.py
+@@ -42,6 +42,7 @@
+     def __init__(self, images, fps):
+         self.frames = images.clamp(0, 1).mul(255).round().to(torch.uint8).numpy()
+         self.total, self.fps, self.audio = len(self.frames), Fraction(fps).limit_denominator(1001), None
++        self.color = None
+ 
+     def get(self, start, stop):
+         return self.frames[start:stop]
+@@ -56,6 +57,10 @@
+         self.container = av.open(video.get_stream_source())
+         stream = self.container.streams.video[0]
+         stream.thread_type = "AUTO"
++        # the frames are turned into RGB with the matrix the file names; the output is made with the same one and
++        # labelled like the input, so the upscale shows the colours the original does in every player
++        context = stream.codec_context
++        self.color = (context.colorspace, context.color_range, context.color_primaries, context.color_trc)
+         start, duration = video.get_active_trim_window()
+         self.start_pts, self.end_pts = int(start / stream.time_base), int((start + duration) / stream.time_base) if duration else None
+         if self.start_pts:
+@@ -98,11 +103,20 @@
+     """Encodes uint8 frames [n, H, W, 3] given on the GPU into an mp4. On CUDA the device-to-host copy runs on a side
+     stream into a pinned slot and a thread encodes it, so neither holds up the next block."""
+ 
+-    def __init__(self, path, width, height, fps, encoder, device, audio=None, chunk=4, slots=3):
++    def __init__(self, path, width, height, fps, encoder, device, audio=None, chunk=4, slots=3, color=None):
+         codec, options = ENCODERS[encoder]
+         self.container = av.open(path, "w")
+         self.stream = self.container.add_stream(codec, rate=fps, options=dict(options))
+         self.stream.width, self.stream.height, self.stream.pix_fmt = width, height, "yuv420p"
++        # color = (colorspace, range, primaries, transfer) of the input, as PyAV numbers. RGB becomes YUV with the
++        # input's matrix (unspecified: swscale's default, the one the input was decoded with) at video range.
++        self.colorspace = None
++        if color is not None:
++            context = self.stream.codec_context
++            space, _, primaries, transfer = color
++            context.colorspace, context.color_range = space, 1  # 1: MPEG (video) range
++            context.color_primaries, context.color_trc = primaries, transfer
++            self.colorspace = space if space not in (0, 2) else None  # 0: RGB, 2: unspecified
+         # every stream before the first packet: the header is written then. audio = (samples [C, S] float32, rate)
+         self.audio = audio
+         if audio is not None:
+@@ -144,7 +158,9 @@
+                     done.synchronize()
+                 if self.error is None:
+                     for frame in self.slots[slot][:n].numpy():
+-                        self.container.mux(self.stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")))
++                        rgb = av.VideoFrame.from_ndarray(frame, format="rgb24")
++                        yuv = rgb.reformat(format="yuv420p", dst_colorspace=self.colorspace, dst_color_range=1)
++                        self.container.mux(self.stream.encode(yuv))
+             except Exception as e:  # raised again in the node's thread by put() or close()
+                 self.error = e
+             self.free.put(slot)

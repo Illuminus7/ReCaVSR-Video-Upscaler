@@ -1,0 +1,242 @@
+diff --git a/recavsr/attention.py b/recavsr/attention.py
+index 48bc31f..24278c6 100644
+--- a/recavsr/attention.py
++++ b/recavsr/attention.py
+@@ -3,15 +3,21 @@ history planes, inside a spatial window, with the temporal RoPE applied relative
+ 
+ The Triton kernel is ReCaVSR's kernels/local_attention.py (Apache-2.0, forward only). A window that covers
+ the whole grid runs through ComfyUI's attention with a slot mask instead."""
++import os
+ import torch
+ 
+ from comfy.ldm.modules.attention import optimized_attention
+ 
++from . import tiled_attention
++
++# without Triton: tiled windowed attention (RECAVSR_TILED=0 restores the slow masked fallback)
++TILED = os.environ.get("RECAVSR_TILED", "1") != "0"
++
+ try:
+     import triton
+     import triton.language as tl
+ except ImportError:
+-    triton = None
++    triton = tl = None
+ 
+ 
+ def rotate_pairs(x, cos, sin):
+@@ -144,8 +150,16 @@ def full_attention(q, ck, cv, pk, pv, slots, past_positions, query_positions, co
+     q = apply_temporal(q, query_positions, cos, sin, span)
+     key = apply_temporal(key, positions, cos, sin, span)
+     valid = torch.cat((slots >= 0, torch.ones_like(query_positions, dtype=torch.bool)))
+-    mask = valid.repeat_interleave(span).view(1, 1, 1, -1)
+     heads = q.shape[2]
++    if not q.is_cuda:
++        # ComfyUI's non-CUDA attention (sub-quadratic on MPS) mishandles boolean masks: drop the planes the router
++        # hides instead and attend unmasked, the same attention
++        if not bool(valid.all()):
++            index = valid.nonzero().flatten()
++            key = key.unflatten(1, (-1, span))[:, index].flatten(1, 2)
++            value = value.unflatten(1, (-1, span))[:, index].flatten(1, 2)
++        return optimized_attention(q.flatten(2), key.flatten(2), value.flatten(2), heads).unflatten(2, (heads, -1))
++    mask = valid.repeat_interleave(span).view(1, 1, 1, -1)
+     return optimized_attention(q.flatten(2), key.flatten(2), value.flatten(2), heads, mask=mask).unflatten(2, (heads, -1))
+ 
+ 
+@@ -162,6 +176,8 @@ def windowed_attention_torch(q, ck, cv, pk, pv, slots, past_positions, query_pos
+     q = apply_temporal(q, query_positions, cos, sin, span)
+     heads = q.shape[2]
+     planes = torch.cat((slots >= 0, torch.ones_like(query_positions, dtype=torch.bool)))
++    if TILED:
++        return tiled_attention.dit_windowed_attention(q, key, value, planes, height, width, wh, ww)
+     k = torch.arange(key.shape[1], device=q.device)
+     ky, kx = (k % span) // width, k % width
+     visible = planes[k // span]
+diff --git a/recavsr/cache.py b/recavsr/cache.py
+index aeb4f2d..855157f 100644
+--- a/recavsr/cache.py
++++ b/recavsr/cache.py
+@@ -96,9 +96,10 @@ class KVCache:
+ 
+ def rotary_table(dim, size, device):
+     """cos/sin per rotary pair, [size, dim // 2], from float64 angles like diffusers' get_1d_rotary_pos_embed."""
+-    freqs = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float64, device=device) / dim))
+-    angles = torch.outer(torch.arange(size, dtype=torch.float64, device=device), freqs)
+-    return angles.cos().float(), angles.sin().float()
++    # built on the CPU: MPS has no float64 (same values on CUDA, where the reference computes them)
++    freqs = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim))
++    angles = torch.outer(torch.arange(size, dtype=torch.float64), freqs)
++    return angles.cos().float().to(device), angles.sin().float().to(device)
+ 
+ 
+ class RollingRoPE:
+diff --git a/recavsr/flashdecoder.py b/recavsr/flashdecoder.py
+index 474e692..94ef2ec 100644
+--- a/recavsr/flashdecoder.py
++++ b/recavsr/flashdecoder.py
+@@ -10,7 +10,8 @@ import torch.nn.functional as F
+ import comfy.quant_ops
+ from comfy.ldm.modules.attention import optimized_attention
+ 
+-from .attention import rotate_pairs, triton, tl
++from . import tiled_attention
++from .attention import TILED, rotate_pairs, triton, tl
+ 
+ ROPE_DIMS = (16, 24, 24)  # temporal, height, width parts of the 64-wide head
+ 
+@@ -110,6 +111,8 @@ def local_attention(query, key, value, height, width, window, group_size, tempor
+                              min(triton.next_power_of_2(ww + bw - 1), triton.next_power_of_2(width)),
+                              qf, nf, nf - qf, temporal_window, group_size, bh, bw, bh * bw, 64, num_warps=4, num_stages=2)
+         return out
++    if TILED:
++        return tiled_attention.decoder_local_attention(query, key, value, height, width, window, group_size, temporal_window)
+     # without Triton or CUDA: 64 queries at a time against every key, masked; many times slower
+     k = torch.arange(nf * n, device=query.device)
+     kg, ky, kx = k // (group_size * n), (k % n) // width, k % width
+diff --git a/recavsr/tiled_attention.py b/recavsr/tiled_attention.py
+new file mode 100644
+index 0000000..f6f998a
+--- /dev/null
++++ b/recavsr/tiled_attention.py
+@@ -0,0 +1,141 @@
++"""Spatially windowed attention without Triton (Apple Silicon / MPS, or any non-CUDA device), tiled.
++
++The Triton kernels walk each query tile over only the key region its windows can reach. The original PyTorch fallback
++instead runs 64 queries at a time against every key with a boolean mask through ComfyUI's attention, which is slow and,
++with ComfyUI's sub-quadratic attention (the MPS default), does not apply boolean masks correctly. This does what the
++kernels do, in PyTorch: queries are cut into spatial tiles and each tile attends, through one masked SDPA call per
++chunk of tiles, to the key region that covers the windows of all its queries (tile + window - 1 per side).
++
++Gathering overlapping key regions copies memory, so an axis is only tiled when the window is clearly smaller than the
++grid; otherwise every query on that axis sees the whole axis and the mask alone cuts the window (no copy).
++The result is the exact windowed attention, up to floating-point summation order.
++"""
++import torch
++import torch.nn.functional as F
++
++TILE = (8, 8)
++TILE_RATIO = 0.6  # tile an axis only when a tile's key span is at most this fraction of the axis
++BUDGET = 1536 * 2**20  # transient bytes (gathered keys/values, mask and scores) per SDPA call
++
++
++def _axis(length, tile, window, clamp, device):
++    """Per tile along one axis: the key coordinates it gathers and which (query, key) pairs are in the window.
++    clamp: the window is shifted to stay inside the grid (the DiT); otherwise it is cut off at the borders (FlashDecoder).
++    Returns tiles, tile, span, keys [tiles, span] (in range, for gathering; None = the whole axis), allowed [tiles, tile, span]."""
++    half = window // 2
++    tile = min(tile, length)
++    span = min(tile + window - 1, length) if clamp else tile + 2 * half - 1
++    gather = span <= TILE_RATIO * length
++    if not gather:
++        tile, span = length, length
++    tiles = -(-length // tile)
++    start = torch.arange(tiles, device=device) * tile
++    q = torch.arange(tiles * tile, device=device).view(tiles, tile)
++    if not gather:
++        keys = torch.arange(length, device=device)[None]
++        valid = torch.ones_like(keys, dtype=torch.bool)
++        lo = (q - half).clamp(0, length - window) if clamp else q - half
++        hi = lo + window if clamp else q + half
++    elif clamp:
++        first = (start - half).clamp(0, length - window).clamp_max(length - span)
++        keys = first[:, None] + torch.arange(span, device=device)
++        lo = (q - half).clamp(0, length - window)
++        hi = lo + window
++        valid = torch.ones_like(keys, dtype=torch.bool)
++    else:
++        keys = (start - half)[:, None] + torch.arange(span, device=device)
++        lo, hi = q - half, q + half
++        valid = (keys >= 0) & (keys < length)
++    allowed = valid[:, None, :] & (keys[:, None, :] >= lo[:, :, None]) & (keys[:, None, :] < hi[:, :, None])
++    return tiles, tile, span, (keys.clamp(0, length - 1) if gather else None), allowed
++
++
++def window_attention(q, k, v, window, clamp, plane_mask=None, tile=None):
++    """q [B, HQ, QP, H, W, D]; k, v [B, HK, KP, H, W, D] (HQ a multiple of HK: grouped-query heads share keys);
++    plane_mask [QP, KP] bool, which key planes each query plane sees (None: all). Returns [B, HQ, QP, H, W, D]."""
++    tile = tile or TILE
++    b, hq, qp, height, width, dim = q.shape
++    hk, kp = k.shape[1], k.shape[2]
++    g = hq // hk
++    device = q.device
++    ty, th, rh, rows, ay = _axis(height, tile[0], window[0], clamp, device)
++    tx, tw, rw, cols, ax = _axis(width, tile[1], window[1], clamp, device)
++    queries, keys = g * qp * th * tw, kp * rh * rw
++
++    # queries as [B * HK, tiles, G * QP * th * tw, D]: grouped heads and query planes share a tile's keys
++    padded = F.pad(q, (0, 0, 0, tx * tw - width, 0, ty * th - height))
++    padded = padded.view(b, hk, g, qp, ty, th, tx, tw, dim).permute(0, 1, 4, 6, 2, 3, 5, 7, 8)
++    padded = padded.reshape(b * hk, ty * tx, queries, dim)
++
++    spatial = ay[:, None, :, None, :, None] & ax[None, :, None, :, None, :]  # [ty, tx, th, tw, rh, rw]
++    spatial = spatial.reshape(ty * tx, 1, 1, th * tw, 1, rh * rw)
++    if plane_mask is not None:
++        spatial = spatial & plane_mask.view(1, 1, qp, 1, kp, 1)
++
++    k, v = k.contiguous(), v.contiguous()
++    size = k.element_size()
++    gathered = rows is not None or cols is not None
++    per_tile_keys = b * hk * keys * dim * size * 2 if gathered else 0
++    per_query = b * hk * keys * (q.element_size() + 1) + keys  # scores and mask for one query row
++    out = []
++    # tile rows in chunks: the key regions of a chunk are gathered at once (index_select along tiled axes only)
++    row_chunk = max(1, min(ty, BUDGET // 2 // max(per_tile_keys * tx, 1))) if gathered else ty
++    for r0 in range(0, ty, row_chunk):
++        r1 = min(r0 + row_chunk, ty)
++
++        def region(t):
++            if rows is not None:
++                t = t.index_select(3, rows[r0:r1].flatten())
++            if cols is not None:
++                t = t.index_select(4, cols.flatten())
++            t = t.view(b, hk, kp, r1 - r0, rh, tx, rw, dim).permute(0, 1, 3, 5, 2, 4, 6, 7)
++            return t.reshape(b * hk, (r1 - r0) * tx, keys, dim)
++
++        kr, vr = region(k), region(v)
++        # SDPA over chunks of tiles, or over chunks of one tile's queries when a single tile is over budget
++        tiles = (r1 - r0) * tx
++        per_tile = per_query * queries
++        chunk = max(1, min(tiles, BUDGET // max(per_tile, 1)))
++        qrows = queries if chunk > 1 or per_tile <= BUDGET else max(1, BUDGET // max(per_query, 1))
++        for c0 in range(0, tiles, chunk):
++            c1 = min(c0 + chunk, tiles)
++            mask = spatial[r0 * tx + c0:r0 * tx + c1].expand(c1 - c0, g, qp, th * tw, kp, rh * rw).reshape(c1 - c0, queries, keys)
++            qs, ks, vs = padded[:, r0 * tx + c0:r0 * tx + c1], kr[:, c0:c1], vr[:, c0:c1]
++            if qrows >= queries:
++                out.append(F.scaled_dot_product_attention(qs, ks, vs, attn_mask=mask))
++            else:
++                out.append(torch.cat([F.scaled_dot_product_attention(qs[:, :, i:i + qrows], ks, vs, attn_mask=mask[:, i:i + qrows])
++                                      for i in range(0, queries, qrows)], 2))
++    out = torch.cat(out, 1).view(b, hk, ty, tx, g, qp, th, tw, dim).permute(0, 1, 4, 5, 2, 6, 3, 7, 8)
++    out = out.reshape(b, hq, qp, ty * th, tx * tw, dim)
++    return out[:, :, :, :height, :width]
++
++
++def decoder_local_attention(query, key, value, height, width, window, group_size, temporal_window):
++    """FlashDecoder's local attention: [B, heads, tokens, D] in and out, the queries the last planes of the keys,
++    block-causal groups of `group_size` planes, `temporal_window` groups back, window cut off at the borders."""
++    n = height * width
++    b, hq, _, dim = query.shape
++    hk = key.shape[1]
++    qf, nf = query.shape[2] // n, key.shape[2] // n
++    qg = (torch.arange(qf, device=query.device) + nf - qf) // group_size
++    kg = torch.arange(nf, device=query.device) // group_size
++    planes = (kg[None] <= qg[:, None]) & (kg[None] > qg[:, None] - temporal_window)
++    out = window_attention(query.view(b, hq, qf, height, width, dim), key.view(b, hk, nf, height, width, dim),
++                           value.view(b, hk, nf, height, width, dim), window, clamp=False, plane_mask=planes)
++    return out.reshape(b, hq, qf * n, dim)
++
++
++def dit_windowed_attention(q, key, value, visible, height, width, wh, ww):
++    """The DiT's windowed self-attention after RoPE: q [B, query tokens, heads, D], key/value [B, key tokens, heads, D]
++    over key planes of which `visible` [planes] are routed in; window clamped inside the grid."""
++    span = height * width
++    b, _, heads, dim = q.shape
++    if not bool(visible.all()):
++        index = visible.nonzero().flatten()
++        key = key.unflatten(1, (-1, span))[:, index].flatten(1, 2)
++        value = value.unflatten(1, (-1, span))[:, index].flatten(1, 2)
++    qf, kf = q.shape[1] // span, key.shape[1] // span
++    grid = lambda t, planes: t.view(b, planes, height, width, heads, dim).permute(0, 4, 1, 2, 3, 5)
++    out = window_attention(grid(q, qf), grid(key, kf), grid(value, kf), (wh, ww), clamp=True)
++    return out.permute(0, 2, 3, 4, 1, 5).reshape(b, qf * span, heads, dim)
