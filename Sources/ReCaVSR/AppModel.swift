@@ -73,7 +73,7 @@ final class AppModel: ObservableObject {
 
     var canUpscale: Bool { videoInfo != nil && modelsFolder != nil && engineReady && !isBusy }
 
-    /// Every model file. One set serves both ×2 and ×4.
+    /// Every model file. One set serves every factor.
     private var allModelFiles: [ModelFile] { ReCaVSRModels.all }
 
     // MARK: - Selection

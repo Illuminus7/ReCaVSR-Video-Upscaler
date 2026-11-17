@@ -1,9 +1,10 @@
 import Foundation
 
-/// Upscale factor. ReCaVSR uses one model for every factor; it was trained for ×4, and its
-/// reference also documents ×2.
+/// Upscale factor, in the order the picker shows them. ReCaVSR uses one model for every
+/// factor; it was trained for ×4, its reference also documents ×2, and ×3 lies between.
 enum Scale: Int, CaseIterable, Identifiable {
     case x2 = 2
+    case x3 = 3
     case x4 = 4
 
     var id: Int { rawValue }

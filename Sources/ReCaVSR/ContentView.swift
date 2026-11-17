@@ -227,6 +227,11 @@ struct ContentView: View {
                     .foregroundStyle(.white.opacity(0.7))
                     .lineLimit(6)
                     .textSelection(.enabled)
+                if message.contains(Upscaler.relayVSR.absoluteString) {
+                    Link("Open RelayVSR Video Upscaler", destination: Upscaler.relayVSR)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(accent)
+                }
             }
         }
     }

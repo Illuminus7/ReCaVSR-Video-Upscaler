@@ -131,21 +131,38 @@ enum Upscaler {
         }
     }
 
+    /// RelayVSR Video Upscaler upscales a video in parts that fit in memory: the one to suggest
+    /// when a video is too big for ReCaVSR even at ×2.
+    static let relayVSR = URL(string: "https://github.com/Illuminus7/RelayVSR-Video-Upscaler")!
+
+    /// What to try next when the video did not fit: a lower factor, or at ×2 (the lowest),
+    /// RelayVSR Video Upscaler. `mightFit` is true when closing other apps could be enough.
+    private static func advice(_ scale: Scale, mightFit: Bool) -> String {
+        let lower = Scale.allCases.filter { $0.rawValue < scale.rawValue }.reversed().map(\.label)
+        if !lower.isEmpty {
+            let factors = lower.joined(separator: " or ")   // "×3 or ×2"
+            return (mightFit ? "Close other apps, or try " : "Try ") + factors + ", or a smaller video."
+        }
+        return (mightFit ? "Close other apps and try again. If it still fails, this" : "This")
+            + " video is too big for this Mac's memory even at ×2. For videos this big, try RelayVSR Video "
+            + "Upscaler, which upscales in parts that fit in memory: \(relayVSR.absoluteString)"
+    }
+
     private static func outOfMemory(info: VideoInfo, scale: Scale, engine: ComfyEngine) -> AppError {
         engine.stoppedError("The engine stopped during the upscale, most likely because a \(info.width)×\(info.height) "
                             + "video at ×\(scale.rawValue) needs more memory than this Mac has free. "
-                            + "Close other apps, or try ×2 or a smaller video.")
+                            + advice(scale, mightFit: true))
     }
 
     /// Turns ReCaVSR's own size check, which speaks of a graphics card's VRAM, into Mac terms.
     private static func explain(_ detail: String, info: VideoInfo, scale: Scale) -> AppError {
         if detail.contains("needs about") && detail.contains("VRAM") {
             return AppError("A \(info.width)×\(info.height) video is too large for this Mac's memory at ×\(scale.rawValue). "
-                            + (scale == .x4 ? "Try ×2, or a smaller video." : "Try a smaller video."))
+                            + advice(scale, mightFit: false))
         }
         if detail.localizedCaseInsensitiveContains("out of memory") {
             return AppError("This Mac ran out of memory upscaling a \(info.width)×\(info.height) video at ×\(scale.rawValue). "
-                            + "Close other apps, or try ×2 or a smaller video.")
+                            + advice(scale, mightFit: true))
         }
         return AppError("The upscale failed inside ComfyUI. \(detail)")
     }

@@ -1,6 +1,6 @@
 # ReCaVSR Video Upscaler
 
-A macOS app (Apple Silicon, macOS 14+) that upscales a video ×2 or ×4 with
+A macOS app (Apple Silicon, macOS 14+) that upscales a video ×2, ×3 or ×4 with
 [ReCaVSR](https://github.com/kopperx/ReCaVSR), a one-step streaming video super-resolution
 model, running on Comfy engine with the int8-Fast node in the background.
 
@@ -103,7 +103,11 @@ The engine's binaries are signed with the hardened runtime and the exceptions in
    ReCaVSR Upscale Video → Save Video) with the int8 transformer, the FlashDecoder, fast
    kernels, seed 42 and no colour fix. ReCaVSR streams: it upscales 21 frames, then 8 at a
    time, and encodes each block as soon as it is decoded, so a longer video costs time and
-   disk, not memory. ×4 is what the model was trained for; ×2 is the reference's other setting.
+   disk, not memory. ×4 is what the model was trained for; ×2 is the reference's other setting,
+   and ×3 lies between. What limits a job is the size of the upscaled frame: a video too big
+   for the Mac's memory even at ×2 is better upscaled with
+   [RelayVSR Video Upscaler](https://github.com/Illuminus7/RelayVSR-Video-Upscaler), which the
+   app then suggests.
 5. **Engine**: the bundled ComfyUI runs headless on a free localhost port. It stays
    loaded for five minutes after a job so the next one starts quickly, then stops.
    Only one copy of the app runs at a time; leftovers from a crash (engine processes,
