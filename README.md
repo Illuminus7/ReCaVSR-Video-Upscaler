@@ -79,12 +79,18 @@ The engine's binaries are signed with the hardened runtime and the exceptions in
 
 ## How it works
 
-1. **Video**: choose or drop an MP4, MOV or M4V. The file is checked when it is
+1. **Modes**: **Single Upscale Mode** upscales the video in the video box. **Batch Upscale
+   Mode** opens a queue beside the window: **Add to Queue** adds the chosen video at the chosen
+   factor, rows can be dragged to reorder or removed, and **Go** upscales the queue from the
+   top (**Stop** ends it and keeps what is left). Each finished video leaves the queue; one that
+   fails stays, with the reason, and the batch goes on. Videos can be added while a batch runs,
+   and the queue is kept when you switch modes, for as long as the app is open.
+2. **Video**: choose or drop an MP4, MOV or M4V. The file is checked when it is
    chosen. The result is always saved as `<name> upscaled.mp4` in the same folder
    (a number is added if the name is taken), with the original audio. Audio MP4 players
    don't expect, such as the PCM in many MOV files, is converted to AAC. A phone video's
    rotation is kept.
-2. **Models**: three files, stored in a folder you pick, in ComfyUI's layout (`recavsr/`):
+3. **Models**: three files, stored in a folder you pick, in ComfyUI's layout (`recavsr/`):
 
    | File | Size | From |
    |---|---|---|
@@ -95,11 +101,11 @@ The engine's binaries are signed with the hardened runtime and the exceptions in
    The int8 transformer is a conversion of kopper/ReCaVSR's 10.6 GB bf16 release: smaller, and
    faster on Apple Silicon with int8-Fast. An existing ComfyUI `models` folder works as-is;
    picking its `recavsr` folder, or the ComfyUI folder above it, is corrected automatically.
-3. **Downloads**: four parts per file at the same time, resumable after Cancel or a quit.
+4. **Downloads**: four parts per file at the same time, resumable after Cancel or a quit.
    Parts are named with the file's hash, so parts of an older upload are never mixed in.
    The joined file is checked against Hugging Face's SHA-256 before it is used, and free
    space is checked first.
-4. **Upscaling**: one ComfyUI run of the ComfyUI-ReCaVSR example workflow (Load Video →
+5. **Upscaling**: one ComfyUI run of the ComfyUI-ReCaVSR example workflow (Load Video →
    ReCaVSR Upscale Video → Save Video) with the int8 transformer, the FlashDecoder, fast
    kernels, seed 42 and no colour fix. ReCaVSR streams: it upscales 21 frames, then 8 at a
    time, and encodes each block as soon as it is decoded, so a longer video costs time and
@@ -108,7 +114,7 @@ The engine's binaries are signed with the hardened runtime and the exceptions in
    for the Mac's memory even at ×2 is better upscaled with
    [RelayVSR Video Upscaler](https://github.com/Illuminus7/RelayVSR-Video-Upscaler), which the
    app then suggests.
-5. **Engine**: the bundled ComfyUI runs headless on a free localhost port. It stays
+6. **Engine**: the bundled ComfyUI runs headless on a free localhost port. It stays
    loaded for five minutes after a job so the next one starts quickly, then stops.
    Only one copy of the app runs at a time; leftovers from a crash (engine processes,
    work files, half-joined downloads) are cleared at the next launch.

@@ -2,8 +2,30 @@ import AppKit
 import Foundation
 import SwiftUI
 
+/// One video waiting in the batch queue, with the factor it was added at.
+struct QueueItem: Identifiable, Equatable {
+    let id = UUID()
+    let url: URL
+    let info: VideoInfo
+    let scale: Scale
+    /// Why the last batch could not upscale it. A failed video stays in the queue, and the
+    /// next Go tries it again.
+    var failure: String?
+}
+
 @MainActor
 final class AppModel: ObservableObject {
+    enum Mode: Hashable, CaseIterable {
+        case single, batch
+
+        var label: String {
+            switch self {
+            case .single: return "Single Upscale Mode"
+            case .batch: return "Batch Upscale Mode"
+            }
+        }
+    }
+
     enum Phase: Equatable {
         case idle
         case notice(String)
@@ -12,8 +34,19 @@ final class AppModel: ObservableObject {
         case working(String, Double?)
         /// The saved file, and how long the upscaling took.
         case finished(URL, TimeInterval)
+        /// A batch ran to its end: how many videos were upscaled and failed, how long it took,
+        /// and the last file saved.
+        case batchFinished(done: Int, failed: Int, took: TimeInterval, last: URL?)
         case failed(String)
     }
+
+    /// Every launch starts in single mode; the queue is kept while the app runs, in both modes.
+    @Published var mode: Mode = .single
+    @Published private(set) var queue: [QueueItem] = []
+    /// True from Go until the batch ends or is stopped.
+    @Published private(set) var isBatchRunning = false
+    /// The queue item being upscaled now.
+    @Published private(set) var runningItemID: UUID?
 
     @Published private(set) var videoURL: URL?
     @Published private(set) var videoInfo: VideoInfo?
@@ -73,6 +106,20 @@ final class AppModel: ObservableObject {
 
     var canUpscale: Bool { videoInfo != nil && modelsFolder != nil && engineReady && !isBusy }
 
+    /// Videos can be added to the queue at any time, also while a batch runs.
+    var canAddToQueue: Bool { videoInfo != nil }
+
+    var canStartBatch: Bool { !queue.isEmpty && modelsFolder != nil && engineReady && !isBusy }
+
+    /// The video and factor can be changed when nothing runs, and during a batch (to queue more).
+    var canEditSelection: Bool { !isBusy || isBatchRunning }
+
+    /// Progress (0…1) of the video being upscaled now, once known.
+    var currentFraction: Double? {
+        if case .working(_, let fraction) = phase { return fraction }
+        return nil
+    }
+
     /// Every model file. One set serves every factor.
     private var allModelFiles: [ModelFile] { ReCaVSRModels.all }
 
@@ -92,7 +139,7 @@ final class AppModel: ObservableObject {
 
     /// Accepts the file only if macOS can read it as a video.
     func setVideo(_ url: URL) {
-        guard !isBusy else { return }
+        guard canEditSelection else { return }
         let check = UUID()
         videoCheck = check
         Task {
@@ -101,10 +148,15 @@ final class AppModel: ObservableObject {
                 guard videoCheck == check else { return }
                 videoURL = url
                 videoInfo = info
-                phase = .idle
+                // During a batch the status area shows its progress; leave it.
+                if !isBusy { phase = .idle }
             } catch {
                 guard videoCheck == check else { return }
-                phase = .failed(error.localizedDescription)
+                if isBusy {
+                    NSSound.beep()
+                } else {
+                    phase = .failed(error.localizedDescription)
+                }
             }
         }
     }
@@ -201,6 +253,75 @@ final class AppModel: ObservableObject {
         jobTask?.cancel()
     }
 
+    // MARK: - Batch queue
+
+    /// Adds the video in the video box, at the chosen factor, to the end of the queue.
+    func addToQueue() {
+        guard let url = videoURL, let info = videoInfo else { return }
+        queue.append(QueueItem(url: url, info: info, scale: scale))
+        if !isBusy { phase = .idle }
+    }
+
+    /// The running video can't be removed; Stop ends the batch instead.
+    func removeFromQueue(_ id: UUID) {
+        guard id != runningItemID else { return }
+        queue.removeAll { $0.id == id }
+    }
+
+    func moveQueue(from source: IndexSet, to destination: Int) {
+        queue.move(fromOffsets: source, toOffset: destination)
+    }
+
+    /// Upscales the queue from the top, each video at its own factor. A finished video leaves
+    /// the queue; one that fails stays, marked, and the batch goes on with the next. The queue
+    /// can change while it runs: each next video is the first one this batch hasn't tried yet.
+    func startBatch() {
+        guard canStartBatch, let folder = modelsFolder else { return }
+        for index in queue.indices { queue[index].failure = nil }
+        let id = beginJob()
+        isBatchRunning = true
+
+        jobTask = Task { [self] in
+            let started = Date()
+            var tried = Set<UUID>()
+            var done = 0, failed = 0
+            var last: URL?
+            do {
+                try await ensureModels(in: folder, job: id)
+                while let item = queue.first(where: { !tried.contains($0.id) }) {
+                    try Task.checkCancellation()
+                    let total = tried.count + queue.filter { !tried.contains($0.id) }.count
+                    let prefix = "\(tried.count + 1) of \(total) · "
+                    tried.insert(item.id)
+                    runningItemID = item.id
+                    upscaleStartedAt = Date()
+                    update(id, .working(prefix + "Starting…", nil))
+                    do {
+                        let output = try await Upscaler.run(input: item.url, info: item.info, scale: item.scale,
+                                                            modelsFolder: folder, engine: engine) { [weak self] text, fraction in
+                            Task { @MainActor in self?.update(id, .working(prefix + text, fraction)) }
+                        }
+                        queue.removeAll { $0.id == item.id }
+                        done += 1
+                        last = output
+                    } catch {
+                        if error is CancellationError || Task.isCancelled { throw CancellationError() }
+                        failed += 1
+                        if let index = queue.firstIndex(where: { $0.id == item.id }) {
+                            queue[index].failure = error.localizedDescription
+                        }
+                    }
+                    runningItemID = nil
+                }
+                endJob(id, .batchFinished(done: done, failed: failed, took: Date().timeIntervalSince(started), last: last))
+            } catch is CancellationError {
+                endJob(id, .cancelled)
+            } catch {
+                endJob(id, .failed(error.localizedDescription))
+            }
+        }
+    }
+
     /// Cancels a running job and stops the engine when the app quits.
     func shutDown() {
         jobTask?.cancel()
@@ -226,6 +347,8 @@ final class AppModel: ObservableObject {
         guard jobID == id else { return }
         jobID = nil
         upscaleStartedAt = nil
+        isBatchRunning = false
+        runningItemID = nil
         phase = finalPhase
         refreshMissingModels()
         scheduleIdleStop()
